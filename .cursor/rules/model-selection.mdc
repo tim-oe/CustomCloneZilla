@@ -1,0 +1,36 @@
+---
+description: Guide model selection based on task type
+alwaysApply: true
+---
+
+# STOP — Check Model Before Every Response
+
+Your FIRST action on every single message, before any thinking, planning, tool use, or text output, is to classify the task and check the model. This is not optional and cannot be skipped.
+
+## Step 1 — Classify the task
+
+| If the request mentions... | Task type |
+|---|---|
+| wiki, confluence, update doc, write docs, README, document, explain, architecture, add a page | **documentation** |
+| implement, fix, refactor, debug, add feature, write a function, create a rule, create a hook, coding | **coding** |
+| review, check this code, find bugs, audit, what's wrong, is this correct | **code review** |
+
+## Step 2 — Check the model
+
+| Task type | Required model |
+|---|---|
+| documentation | `claude-opus-4-7-thinking-high` (Opus) |
+| coding | `claude-4.6-sonnet-medium-thinking` (Sonnet) |
+| code review | `gpt-5.3-codex` (Codex) |
+
+## Step 3 — If the model is wrong, output this and STOP
+
+```
+âš ï¸ This task is best handled by [Model]. Please switch using the model picker before continuing.
+```
+
+Do not output anything else. Do not start the task. Do not use any tools. Wait for the user to switch or say "continue anyway".
+
+## Step 4 — Only if the model is correct (or user overrides), proceed normally.
+
+If the user says "continue anyway" or "it's fine", proceed without further warnings for the rest of the session.

@@ -1,0 +1,49 @@
+---
+description: Workflow rules for the agent — commit policy and command verification
+alwaysApply: true
+---
+
+# Commit Policy
+
+**NEVER run `git commit`, `git push`, or any command that records or publishes
+changes unless the user has explicitly asked for it in that turn.**
+
+- Do not commit "to save progress", "as a baseline", or "before making more
+  changes" on your own initiative.
+- If uncertain whether a commit is wanted, ask first.
+- Explicit requests look like: "commit this", "commit with message X",
+  "push the branch", "make a PR". Nothing else counts.
+
+# Command Verification
+
+After every shell command, **verify it actually succeeded before claiming it
+worked**.  "Exit code 0" alone is not proof — many commands exit 0 when the
+target is wrong (e.g. `dd` to a non-existent path via shell redirection, a
+mount that silently fell back to a different filesystem, a build that skipped
+the file you cared about).
+
+Required verification patterns:
+
+- **Writes to disk / devices** (`dd`, `cp`, `mv`, `tar`, `mkisofs`, `xorriso`):
+  confirm the destination contains the expected bytes.  Mount / list / read
+  a sample after writing.
+- **Device operations** (`dd of=/dev/X`): confirm the device exists with
+  `lsblk` *before* running, and verify content on the device *after*.  A
+  suspiciously fast transfer (e.g. 2 GB/s for a USB stick) means the data
+  almost certainly did not land where you think — stop and investigate.
+- **Package installs**: verify the binary is on PATH or in the expected
+  location after installing.
+- **Config / code edits**: read the file back or run the parser/linter to
+  confirm the change is in effect.
+- **Builds**: inspect the output artifact, not just the build log.  Extract
+  and grep the artifact for the specific change.
+
+# Do Not Claim Success Without Evidence
+
+- Do not say "that works", "it's fixed", "the USB has X", or "verified"
+  unless the current turn contains a tool-call result that demonstrates it.
+- If a previous turn verified something but the environment has since
+  changed (USB unplugged, process killed, file deleted), the prior
+  verification is void — re-verify.
+- When a command's result is ambiguous, say so and gather more evidence
+  rather than assuming success.

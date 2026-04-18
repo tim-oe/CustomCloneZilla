@@ -63,7 +63,7 @@ CZ_POST_ACTION="reboot"
 ### 3 — Build the ISO
 
 ```bash
-./customize-clonezilla.sh --config config/mysite.conf
+./build-iso.sh --config config/mysite.conf
 # or
 make restore CONFIG=config/mysite.conf
 ```
@@ -71,15 +71,21 @@ make restore CONFIG=config/mysite.conf
 ### 4 — Write to USB
 
 ```bash
-sudo dd if=custom-clonezilla.iso of=/dev/sdX bs=4M status=progress oflag=sync
+sudo ./burn-usb.sh /dev/sdX
+# or with a specific ISO:
+sudo ./burn-usb.sh --iso build/custom-clonezilla.iso /dev/sdX
 ```
+
+`burn-usb.sh` will verify the ISO checksum, prompt for confirmation, write the
+image with `dd`, then mount the USB and print the embedded `build-info.txt` so
+you can confirm exactly which build landed on the device.
 
 ---
 
 ## Usage
 
 ```
-./customize-clonezilla.sh [OPTIONS]
+./build-iso.sh [OPTIONS]
 ```
 
 ### Locale options
@@ -147,7 +153,7 @@ sudo dd if=custom-clonezilla.iso of=/dev/sdX bs=4M status=progress oflag=sync
 ### Locale and keyboard only (interactive menu)
 
 ```bash
-./customize-clonezilla.sh \
+./build-iso.sh \
   --language fr_FR.UTF-8 \
   --keyboard fr \
   --timezone Europe/Paris
@@ -162,7 +168,7 @@ Restores the image `ubuntu-24.04` from an NFS share to `/dev/sda`, then
 reboots automatically — no user interaction required.
 
 ```bash
-./customize-clonezilla.sh \
+./build-iso.sh \
   --language en_US.UTF-8 --keyboard us \
   --nfs-server 192.168.1.100 --nfs-share /mnt/backups \
   --mode restore \
@@ -177,7 +183,7 @@ Saves a compressed image of `/dev/sda` to the NFS share as `server01`, then
 powers off.
 
 ```bash
-./customize-clonezilla.sh \
+./build-iso.sh \
   --nfs-server 192.168.1.100 --nfs-share /mnt/backups \
   --mode backup \
   --disk sda \
@@ -189,7 +195,7 @@ powers off.
 ### Use a pre-downloaded ISO
 
 ```bash
-./customize-clonezilla.sh \
+./build-iso.sh \
   --iso ~/Downloads/clonezilla-live-3.1.2-22-amd64.iso \
   --config config/settings.conf
 ```
@@ -274,7 +280,9 @@ available.
 
 ```
 CustomCloneZilla/
-├── customize-clonezilla.sh   # Main script
+├── build-iso.sh              # Main build script
+├── dhcp.sh                   # Minimal DHCP-test ISO builder
+├── burn-usb.sh               # Write ISO to USB and verify
 ├── config/
 │   └── settings.conf         # All configurable settings (copy and edit)
 ├── Makefile                  # Convenience targets

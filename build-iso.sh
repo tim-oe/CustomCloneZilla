@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #==============================================================================
-# customize-clonezilla.sh
+# build-iso.sh
 #
 # Customize a Clonezilla Live ISO with:
 #   - Language / locale settings
@@ -14,8 +14,8 @@
 # Requires: xorriso wget
 # Install:  sudo apt-get install xorriso wget
 #
-# Usage: ./customize-clonezilla.sh [OPTIONS]
-#        ./customize-clonezilla.sh --help
+# Usage: ./build-iso.sh [OPTIONS]
+#        ./build-iso.sh --help
 #==============================================================================
 
 set -euo pipefail
@@ -53,8 +53,12 @@ CLONEZILLA_DOWNLOAD_URL=""
 
 # Working / output paths (all computed in compute_defaults)
 BUILD_DIR=""        # ${SCRIPT_DIR}/build  — gitignored, survives between runs
-ISO_EXTRACT_DIR=""  # ${BUILD_DIR}/iso     — recreated each build
+ISO_EXTRACT_DIR=""  # ${BUILD_DIR}/extract — recreated each build
 OUTPUT_ISO=""       # ${BUILD_DIR}/custom-clonezilla.iso
+
+# Build identifiers (set once at startup so all steps share the same timestamp)
+BUILD_TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
+BUILD_DATE_TAG="$(date '+%Y%m%d-%H%M%S')"
 
 # ---------- Locale / Input ---------------------------------------------------
 LANGUAGE="en_US.UTF-8"
@@ -120,7 +124,7 @@ ${BOLD}NETWORK OPTIONS${RESET}
       --dhcp                  Enable DHCP on boot (default: enabled)
       --no-dhcp               Disable DHCP injection (use live system default)
       --network-interface IF  DHCP on a specific interface, e.g. eth0
-                              (default: all interfaces)
+                              uses ip=<IF>:dhcp  (default: all interfaces, ip=dhcp)
 
 ${BOLD}NFS OPTIONS${RESET}
   -s, --nfs-server IP         NFS server IP or hostname
@@ -231,17 +235,18 @@ compute_defaults() {
   # All build artefacts live under build/ in the repo root.
   # build/ is gitignored so large binaries never land in the repo.
   BUILD_DIR="${SCRIPT_DIR}/build"
-  ISO_EXTRACT_DIR="${BUILD_DIR}/iso"
+  ISO_EXTRACT_DIR="${BUILD_DIR}/extract"
 
   if [[ -z "${CLONEZILLA_DOWNLOAD_URL}" ]]; then
     local iso_file="clonezilla-live-${CLONEZILLA_VERSION}-${CLONEZILLA_ARCH}.iso"
     CLONEZILLA_DOWNLOAD_URL="https://downloads.sourceforge.net/project/clonezilla/clonezilla_live_stable/${CLONEZILLA_VERSION}/${iso_file}"
   fi
 
-  # Cache the downloaded ISO in build/ so subsequent runs skip the download.
+  # Cache the downloaded ISO in build/iso/ so subsequent runs skip the download.
+  # build/iso/ is preserved across runs; everything else in build/ is purged.
   # A user-supplied --iso path is used as-is (read-only; never overwritten).
   if [[ -z "${LOCAL_ISO}" ]]; then
-    LOCAL_ISO="${BUILD_DIR}/clonezilla-live-${CLONEZILLA_VERSION}-${CLONEZILLA_ARCH}.iso"
+    LOCAL_ISO="${BUILD_DIR}/iso/clonezilla-live-${CLONEZILLA_VERSION}-${CLONEZILLA_ARCH}.iso"
   fi
 
   # Output ISO defaults to build/ if not explicitly set via --output
@@ -272,7 +277,7 @@ validate_config() {
     *) die "Invalid --nfs-version '${NFS_VERSION}'. Must be: 3 | 4" ;;
   esac
 
-  if [[ -n "${LOCAL_ISO}" && "${LOCAL_ISO}" != "${BUILD_DIR}/clonezilla-live-${CLONEZILLA_VERSION}-${CLONEZILLA_ARCH}.iso" ]]; then
+  if [[ -n "${LOCAL_ISO}" && "${LOCAL_ISO}" != "${BUILD_DIR}/iso/clonezilla-live-${CLONEZILLA_VERSION}-${CLONEZILLA_ARCH}.iso" ]]; then
     [[ -f "${LOCAL_ISO}" ]] || die "Local ISO not found: ${LOCAL_ISO}"
   fi
 }
@@ -313,7 +318,7 @@ obtain_iso() {
     return 0
   fi
 
-  mkdir -p "${BUILD_DIR}"
+  mkdir -p "${BUILD_DIR}/iso"
   wget --progress=bar:force:noscroll \
        --timeout=60 \
        --tries=3 \
@@ -350,22 +355,12 @@ extract_iso() {
 }
 
 # ---- Build the Clonezilla boot parameter string ----------------------------
-# Outputs kernel parameters for the live boot line.
-#
-# GRUB / /proc/cmdline quoting rules (from Clonezilla source drbl-functions):
-#   ocs_prerun1=dhcpcd            → ocs_prerun1=dhcpcd          (no quotes needed)
-#   ocs_prerun1="cmd arg"         → "ocs_prerun1=cmd arg"        (GRUB2 wraps in " ")
-#   ocs_prerun1=\"cmd arg\"       → ocs_prerun1=\"cmd arg\"      (literal backslash-quotes)
-#
-# For single-word commands use no quotes at all — the most reliable form.
-# For multi-word commands use backslash-escaped quotes so Clonezilla's
-# parse_cmdline_option handles them via the explicit case-3 branch.
-#
-# Network strategy:
-#   dhcpcd (no args): gets a DHCP lease on all interfaces, blocks until done
-#   (default ~30 s timeout), then exits 0.  Unlike dhclient, dhcpcd supports
-#   a command-line timeout and doesn't need -timeout via dhclient.conf.
-#   net.ifnames=0 keeps traditional eth0/eth1 names, matching stock Clonezilla.
+# ip=dhcp        : live-boot's built-in DHCP — resolves an address during the
+#                  initrd stage, before the rootfs is mounted and before any
+#                  Clonezilla script runs.  This is the earliest possible point
+#                  to obtain a lease and is confirmed to work on tested hardware.
+# net.ifnames=0  : keep traditional eth0/eth1 names; live-boot's ip= handling
+#                  and Clonezilla both expect these predictable names.
 build_boot_params() {
   local p=""
 
@@ -375,34 +370,14 @@ build_boot_params() {
   [[ -n "${KEYBOARD_VARIANT}" ]] && p+=" keyboard-variants=${KEYBOARD_VARIANT}"
   p+=" ocs_lang=${LANGUAGE}"
 
-  # Traditional interface naming (stock Clonezilla uses this, not ip=dhcp)
-  [[ "${NETWORK_DHCP}" == "true" ]] && p+=" net.ifnames=0"
-
-  # ocs_prerun sequence — each entry is one plain command, no shell operators.
-  local idx=1
-
-  if [[ -n "${NFS_SERVER}" && -n "${NFS_SHARE}" ]]; then
-    # NFS workflow: dhcpcd first (waits for lease), then mount
-    if [[ "${NETWORK_DHCP}" == "true" ]]; then
-      # Single-word command — no quotes needed, most reliable GRUB parsing
-      if [[ -n "${NETWORK_INTERFACE}" ]]; then
-        # Interface specified: backslash-quoted so spaces survive /proc/cmdline
-        p+=" ocs_prerun${idx}=\\\"dhcpcd ${NETWORK_INTERFACE}\\\""; idx=$(( idx + 1 ))
-      else
-        p+=" ocs_prerun${idx}=dhcpcd"; idx=$(( idx + 1 ))
-      fi
-    fi
-    local mount_type="nfs"
-    [[ "${NFS_VERSION}" == "4" ]] && mount_type="nfs4"
-    # Backslash-quoted: Clonezilla parse_cmdline_option handles \"...\" explicitly
-    p+=" ocs_prerun${idx}=\\\"mount -t ${mount_type} -o ${NFS_OPTS} ${NFS_SERVER}:${NFS_SHARE} /home/partimag\\\""
-
-  elif [[ "${NETWORK_DHCP}" == "true" ]]; then
-    # DHCP-only: single-word, no quotes needed
+  # DHCP via live-boot's ip= parameter — lease is obtained in the initrd stage
+  # so the interface is up before Clonezilla or any ocs_prerun script starts.
+  if [[ "${NETWORK_DHCP}" == "true" ]]; then
+    p+=" net.ifnames=0"
     if [[ -n "${NETWORK_INTERFACE}" ]]; then
-      p+=" ocs_prerun1=\\\"dhcpcd ${NETWORK_INTERFACE}\\\""
+      p+=" ip=${NETWORK_INTERFACE}:dhcp"
     else
-      p+=" ocs_prerun1=dhcpcd"
+      p+=" ip=dhcp"
     fi
   fi
 
@@ -458,9 +433,9 @@ modify_grub_cfg() {
   boot_params="$(build_boot_params)"
 
   case "${CZ_MODE}" in
-    backup)      entry_label="Clonezilla Backup  [${CZ_IMAGE_NAME} <- ${CZ_DISK}]" ;;
-    restore)     entry_label="Clonezilla Restore [${CZ_IMAGE_NAME} -> ${CZ_DISK}]" ;;
-    interactive) entry_label="Clonezilla Live Custom (${LANGUAGE} / ${KEYBOARD_LAYOUT})" ;;
+    backup)      entry_label="Clonezilla Backup  [${CZ_IMAGE_NAME} <- ${CZ_DISK}] [${BUILD_DATE_TAG}]" ;;
+    restore)     entry_label="Clonezilla Restore [${CZ_IMAGE_NAME} -> ${CZ_DISK}] [${BUILD_DATE_TAG}]" ;;
+    interactive) entry_label="Clonezilla Live Custom (${LANGUAGE} / ${KEYBOARD_LAYOUT}) [${BUILD_DATE_TAG}]" ;;
   esac
 
   if [[ "${DRY_RUN}" == "true" ]]; then
@@ -478,7 +453,7 @@ modify_grub_cfg() {
   # Prepend our entry at the top; strip duplicate set default/timeout lines from
   # the original so the menu correctly defaults to our entry (index 0).
   {
-    printf "# CustomCloneZilla %s\n" "${VERSION}"
+    printf "# CustomCloneZilla %s build %s\n" "${VERSION}" "${BUILD_DATE_TAG}"
     printf "set default=0\n"
     printf "set timeout=30\n\n"
     printf "%s\n" "${new_entry}"
@@ -546,9 +521,9 @@ modify_isolinux_cfg() {
   boot_params="$(build_isolinux_params)"
 
   case "${CZ_MODE}" in
-    backup)      entry_label="NFS Backup: ${CZ_IMAGE_NAME} <- ${CZ_DISK}" ;;
-    restore)     entry_label="NFS Restore: ${CZ_IMAGE_NAME} -> ${CZ_DISK}" ;;
-    interactive) entry_label="Custom Clonezilla (${LANGUAGE} / ${KEYBOARD_LAYOUT})" ;;
+    backup)      entry_label="NFS Backup: ${CZ_IMAGE_NAME} <- ${CZ_DISK} [${BUILD_DATE_TAG}]" ;;
+    restore)     entry_label="NFS Restore: ${CZ_IMAGE_NAME} -> ${CZ_DISK} [${BUILD_DATE_TAG}]" ;;
+    interactive) entry_label="Custom Clonezilla (${LANGUAGE} / ${KEYBOARD_LAYOUT}) [${BUILD_DATE_TAG}]" ;;
   esac
 
   for cfg in "${cfg_candidates[@]}"; do
@@ -582,6 +557,40 @@ modify_isolinux_cfg() {
   fi
 }
 
+# ---- Write build metadata into the ISO tree ---------------------------------
+write_build_info() {
+  section "Writing build metadata"
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log "[DRY RUN] Would write: ${ISO_EXTRACT_DIR}/build-info.txt"
+    return 0
+  fi
+
+  local out="${ISO_EXTRACT_DIR}/build-info.txt"
+  cat > "${out}" <<METAEOF
+CustomCloneZilla Build
+======================
+ISO name   : $(basename "${OUTPUT_ISO}")
+Build date : ${BUILD_TIMESTAMP}
+Build tag  : ${BUILD_DATE_TAG}
+Base ISO   : $(basename "${LOCAL_ISO}")
+Language   : ${LANGUAGE}
+Keyboard   : ${KEYBOARD_LAYOUT}${KEYBOARD_VARIANT:+ (${KEYBOARD_VARIANT})}
+Timezone   : ${TIMEZONE}
+DHCP       : ${NETWORK_DHCP}
+Mode       : ${CZ_MODE}
+$(if [[ -n "${NFS_SERVER}" ]]; then
+  printf "NFS server : %s\n" "${NFS_SERVER}"
+  printf "NFS share  : %s\n" "${NFS_SHARE}"
+fi)
+To verify a USB key written from this ISO, mount it and check:
+  cat /build-info.txt
+METAEOF
+
+  log "build-info.txt written"
+  debug "$(cat "${out}")"
+}
+
 # ---- Repack bootable ISO ----------------------------------------------------
 repack_iso() {
   section "Repacking ISO"
@@ -592,64 +601,17 @@ repack_iso() {
   fi
 
   mkdir -p "$(dirname "${OUTPUT_ISO}")"
-  # Remove any leftover output from a previous failed run so xorriso starts fresh
   rm -f "${OUTPUT_ISO}"
   log "Building ISO: ${OUTPUT_ISO}"
 
   local xorriso_log="${BUILD_DIR}/xorriso.log"
 
-  # Extract MBR bootstrap code (first 432 bytes) for USB hybrid boot
+  # Extract MBR bootstrap code (first 432 bytes) for USB hybrid boot.
+  # This carries the original hybrid MBR so the USB is bootable on BIOS machines.
   local mbr_file="${BUILD_DIR}/isohdpfx.bin"
   dd if="${LOCAL_ISO}" bs=432 count=1 of="${mbr_file}" 2>/dev/null \
     && debug "MBR extracted: ${mbr_file}" \
     || warn "Could not extract MBR — USB hybrid boot may not work."
-
-  # --- Primary method: xorriso native mode -----------------------------------
-  # Only update the config files we actually changed (grub.cfg / syslinux.cfg).
-  # Everything else — squashfs, kernel, EFI image — is carried over verbatim
-  # from -indev, so the boot record stays bit-for-bit identical to the original.
-  # -commit is required; without it xorriso queues changes but never writes.
-  log "Repacking (native mode) ..."
-
-  local native_args=(
-    -indev  "${LOCAL_ISO}"
-    -outdev "${OUTPUT_ISO}"
-    -volid  "CLONEZILLA_CUSTOM"
-  )
-
-  # Add -update for each config file that was actually modified (identified
-  # by the presence of the .orig backup created in the modify_* functions)
-  local f iso_path
-  for f in \
-      "${ISO_EXTRACT_DIR}/boot/grub/grub.cfg" \
-      "${ISO_EXTRACT_DIR}/boot/grub/efi.img" \
-      "${ISO_EXTRACT_DIR}/isolinux/isolinux.cfg" \
-      "${ISO_EXTRACT_DIR}/syslinux/syslinux.cfg" \
-      "${ISO_EXTRACT_DIR}/isolinux/syslinux.cfg"; do
-    [[ -f "${f}.orig" ]] || continue
-    iso_path="${f#${ISO_EXTRACT_DIR}}"
-    native_args+=( -update "${f}" "${iso_path}" )
-    debug "Staging update: ${iso_path}"
-  done
-
-  native_args+=( -boot_image any replay -commit )
-
-  if xorriso "${native_args[@]}" >"${xorriso_log}" 2>&1; then
-    [[ "${VERBOSE}" == "true" ]] && cat "${xorriso_log}"
-    rm -f "${xorriso_log}"
-    local size; size="$(du -sh "${OUTPUT_ISO}" 2>/dev/null | cut -f1)"
-    log "ISO created: ${OUTPUT_ISO} (${size})"
-    return 0
-  fi
-
-  warn "Native repack failed — reason:"
-  grep -iE '(FAILURE|fail|ERROR)' "${xorriso_log}" | head -5 >&2 || cat "${xorriso_log}" >&2
-  rm -f "${OUTPUT_ISO}"
-
-  # --- Fallback: xorriso -as mkisofs -----------------------------------------
-  # Build boot flags as a proper bash array so IFS=$'\n\t' doesn't swallow
-  # the individual flags (unquoted string expansion breaks with this IFS).
-  warn "Trying mkisofs-compat fallback ..."
 
   # Locate the isolinux/syslinux binary inside the extracted tree
   local isolinux_bin="" isolinux_cat=""
@@ -665,7 +627,8 @@ repack_iso() {
 
   local efi_img="${ISO_EXTRACT_DIR}/boot/grub/efi.img"
 
-  # Build flags as an array — safe with any IFS
+  # Build boot flags as a proper bash array so IFS=$'\n\t' doesn't swallow
+  # individual flags (unquoted string expansion breaks with this IFS).
   local boot_flags=()
   if [[ -f "${mbr_file}" ]]; then
     boot_flags+=( --grub2-mbr "${mbr_file}" --protective-msdos-label -partition_offset 16 )
@@ -678,8 +641,13 @@ repack_iso() {
     boot_flags+=( -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot -isohybrid-gpt-basdat )
   fi
 
-  debug "Fallback boot flags: ${boot_flags[*]}"
+  debug "Boot flags: ${boot_flags[*]}"
 
+  # xorriso -as mkisofs: rebuilds a bootable hybrid ISO from the extracted tree.
+  # The original MBR (--grub2-mbr) ensures USB hybrid boot works on BIOS machines.
+  # The updated efi.img in the extract dir carries our custom grub.cfg so UEFI
+  # firmware sees the custom menu entry without needing a chain-loader lookup.
+  log "Repacking ISO ..."
   if xorriso -as mkisofs \
        -r \
        -V "CLONEZILLA_CUSTOM" \
@@ -689,13 +657,13 @@ repack_iso() {
        "${ISO_EXTRACT_DIR}" \
        >"${xorriso_log}" 2>&1; then
     [[ "${VERBOSE}" == "true" ]] && cat "${xorriso_log}"
+    rm -f "${xorriso_log}"
   else
     cat "${xorriso_log}" >&2
     rm -f "${xorriso_log}"
-    die "Both repack attempts failed. Re-run with --verbose for full xorriso output."
+    die "ISO repack failed. Re-run with --verbose for full xorriso output."
   fi
 
-  rm -f "${xorriso_log}"
   local size
   size="$(du -sh "${OUTPUT_ISO}" 2>/dev/null | cut -f1)"
   log "ISO created: ${OUTPUT_ISO} (${size})"
@@ -747,7 +715,7 @@ cleanup() {
   rm -f "${BUILD_DIR}/xorriso.log" "${BUILD_DIR}/isohdpfx.bin" 2>/dev/null || true
 
   # Remove the extracted ISO tree (regenerated on every run).
-  # The downloaded source ISO (build/clonezilla-live-*.iso) is intentionally
+  # The downloaded source ISO lives in build/iso/ and is intentionally
   # kept so subsequent builds skip the download step.
   if [[ -d "${ISO_EXTRACT_DIR}" ]]; then
     if [[ "${KEEP_WORK_DIR}" == "true" ]]; then
@@ -784,8 +752,18 @@ main() {
   check_deps
   trap cleanup EXIT
 
+  # Purge all build artefacts except the ISO cache so each run starts clean.
+  # build/iso/ holds the downloaded source ISO and is always preserved.
+  if [[ "${DRY_RUN}" != "true" ]]; then
+    mkdir -p "${BUILD_DIR}/iso"
+    find "${BUILD_DIR}" -mindepth 1 -maxdepth 1 ! -name 'iso' \
+      -exec sudo rm -rf {} + 2>/dev/null || true
+    debug "Build directory purged (build/iso/ retained)"
+  fi
+
   obtain_iso
   extract_iso
+  write_build_info
   modify_grub_cfg
   modify_isolinux_cfg
   repack_iso

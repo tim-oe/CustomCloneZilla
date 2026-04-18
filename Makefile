@@ -1,6 +1,6 @@
 .PHONY: help deps check backup restore interactive clean distclean
 
-SCRIPT  := ./customize-clonezilla.sh
+SCRIPT  := ./build-iso.sh
 CONFIG  := config/settings.conf
 
 # ---- Help -------------------------------------------------------------------
