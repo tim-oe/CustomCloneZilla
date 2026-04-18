@@ -11,8 +11,8 @@
 # Both UEFI (GRUB2) and legacy BIOS (isolinux/syslinux) boot entries are
 # updated so the resulting ISO boots correctly on any hardware.
 #
-# Requires: xorriso wget
-# Install:  sudo apt-get install xorriso wget
+# Requires: xorriso wget mtools
+# Install:  sudo apt-get install xorriso wget mtools
 #
 # Usage: ./build-iso.sh [OPTIONS]
 #        ./build-iso.sh --help
@@ -45,9 +45,9 @@ hr()      { printf '%*s\n' "${COLUMNS:-80}" '' | tr ' ' '-'; }
 # ---- Defaults (overridden by config file, then by CLI args) -----------------
 
 # Clonezilla release to download if no local ISO is provided
+# Only amd64 is available for Clonezilla 3.x — i686 was dropped at 3.2.0-8.
 CLONEZILLA_VERSION="3.3.1-35"
 CLONEZILLA_ARCH="amd64"
-CLONEZILLA_FLAVOR="debian-bookworm"
 # Full URL is auto-computed in compute_defaults(); override here to pin a mirror
 CLONEZILLA_DOWNLOAD_URL=""
 
@@ -75,11 +75,11 @@ NETWORK_DHCP="true"
 NETWORK_INTERFACE=""
 
 # ---------- NFS Configuration ------------------------------------------------
-NFS_SERVER=""       # e.g. 192.168.1.100
-NFS_SHARE=""        # e.g. /mnt/backups
-NFS_OPTS="defaults"                 # mount options passed to -o
-NFS_VERSION="4"                     # 3 or 4
-NFS_WAIT_SEC="15"                   # seconds to sleep before NFS mount (lets DHCP settle)
+NFS_SERVER="192.168.1.30"             # your NFS server IP or hostname
+NFS_SHARE="/mnt/main/backup/systems"  # your NFS share path
+NFS_OPTS="defaults"                   # mount options passed to -o
+NFS_VERSION="4"                       # NFS version: 3 or 4
+NFS_WAIT_SEC="15"                     # seconds to sleep before NFS mount (lets DHCP settle)
 
 # ---------- Clonezilla Operation ---------------------------------------------
 # Mode: backup | restore | interactive
@@ -117,7 +117,7 @@ ${BOLD}USAGE${RESET}
 ${BOLD}LOCALE OPTIONS${RESET}
   -l, --language LOCALE       System locale            (default: ${LANGUAGE})
   -k, --keyboard LAYOUT       Keyboard layout          (default: ${KEYBOARD_LAYOUT})
-      --keyboard-variant VAR  Keyboard variant         (default: none)
+      --keyboard-variant VAR  Keyboard variant         (default: none)  [untested]
   -z, --timezone TZ           Timezone                 (default: ${TIMEZONE})
 
 ${BOLD}NETWORK OPTIONS${RESET}
@@ -125,11 +125,13 @@ ${BOLD}NETWORK OPTIONS${RESET}
       --no-dhcp               Disable DHCP injection (use live system default)
       --network-interface IF  DHCP on a specific interface, e.g. eth0
                               uses ip=<IF>:dhcp  (default: all interfaces, ip=dhcp)
+                              [untested — prefer leaving unset with ip=dhcp]
 
 ${BOLD}NFS OPTIONS${RESET}
   -s, --nfs-server IP         NFS server IP or hostname
   -n, --nfs-share PATH        Exported NFS path  (e.g. /mnt/backups)
-      --nfs-opts OPTS         Mount options            (default: ${NFS_OPTS})
+      --nfs-opts OPTS         Extra mount options appended to nfsvers=N
+                              (default: ${NFS_OPTS})  [untested — leave as default]
       --nfs-version VER       NFS version: 3 or 4     (default: ${NFS_VERSION})
       --nfs-wait SEC          Seconds to wait for DHCP (default: ${NFS_WAIT_SEC})
 
@@ -140,13 +142,11 @@ ${BOLD}OPERATION OPTIONS${RESET}  (require --nfs-server and --nfs-share)
       --compress TYPE         Compression type         (default: ${CZ_COMPRESS})
                               z0=none z1p=gzip z2p=bzip2 z3p=lzop z4p=lzma z5p=xz
       --post-action ACTION    reboot | poweroff | choose  (default: ${CZ_POST_ACTION})
-      --extra-args ARGS       Extra ocs-sr arguments (advanced)
+      --extra-args ARGS       Extra ocs-sr arguments (advanced)  [untested]
 
 ${BOLD}ISO OPTIONS${RESET}
       --iso FILE              Use local ISO instead of downloading
       --czversion VER         Clonezilla version       (default: ${CLONEZILLA_VERSION})
-      --czarch ARCH           amd64 | i686             (default: ${CLONEZILLA_ARCH})
-      --czflavor FLAVOR       debian-bookworm | ubuntu-focal  (default: ${CLONEZILLA_FLAVOR})
   -o, --output FILE           Output ISO path          (default: build/custom-clonezilla.iso)
 
 ${BOLD}SCRIPT OPTIONS${RESET}
@@ -175,11 +175,11 @@ ${BOLD}EXAMPLES${RESET}
   ${SCRIPT_NAME} --config config/settings.conf
 
 ${BOLD}WRITE TO USB${RESET}
-  sudo dd if=custom-clonezilla.iso of=/dev/sdX bs=4M status=progress oflag=sync
+  sudo ./burn-usb.sh [--iso <output-iso>] /dev/sdX
 
 ${BOLD}DEPENDENCIES${RESET}
   Required : xorriso  wget
-  Install  : sudo apt-get install xorriso wget
+  Optional : mtools   (patches efi.img for UEFI; install: sudo apt-get install mtools)
 
 EOF
 }
@@ -209,8 +209,6 @@ parse_args() {
          --extra-args)        CZ_EXTRA_ARGS="$2";         shift 2 ;;
          --iso)               LOCAL_ISO="$2";             shift 2 ;;
          --czversion)         CLONEZILLA_VERSION="$2";    shift 2 ;;
-         --czarch)            CLONEZILLA_ARCH="$2";       shift 2 ;;
-         --czflavor)          CLONEZILLA_FLAVOR="$2";     shift 2 ;;
       -o|--output)            OUTPUT_ISO="$2";            shift 2 ;;
          --keep-work-dir)     KEEP_WORK_DIR="true";       shift   ;;
          --dry-run)           DRY_RUN="true";             shift   ;;
@@ -379,6 +377,27 @@ build_boot_params() {
     else
       p+=" ip=dhcp"
     fi
+  fi
+
+  # NFS mount via ocs_prerun — runs before Clonezilla's UI starts.
+  #
+  # ocs_prerun1: sleep so the ip=dhcp lease (obtained in initrd) has settled.
+  # ocs_prerun2: mount the NFS share at Clonezilla's image directory.
+  # ocs_prerun3: write ocsroot_src=skip to ocs-live.conf so ocs-prep-repo skips
+  #              the storage-type selection dialog (it checks: if ocsroot_src is
+  #              already set, skip the menu — source: sbin/ocs-prep-repo line 1187).
+  # ocs_prerun4: write ocs_live_type=device-image so the clonezilla script skips
+  #              the mode selection dialog and goes straight to save/restore
+  #              (source: sbin/clonezilla line 52).
+  if [[ -n "${NFS_SERVER}" && -n "${NFS_SHARE}" ]]; then
+    local nfs_mount_opts="nfsvers=${NFS_VERSION}"
+    [[ "${NFS_OPTS}" != "defaults" && -n "${NFS_OPTS}" ]] \
+      && nfs_mount_opts="${nfs_mount_opts},${NFS_OPTS}"
+
+    p+=" ocs_prerun1=\"sleep ${NFS_WAIT_SEC}\""
+    p+=" ocs_prerun2=\"mount -t nfs -o ${nfs_mount_opts} ${NFS_SERVER}:${NFS_SHARE} /home/partimag\""
+    p+=" ocs_prerun3=\"echo ocsroot_src=skip >> /etc/ocs/ocs-live.conf\""
+    p+=" ocs_prerun4=\"echo ocs_live_type=device-image >> /etc/ocs/ocs-live.conf\""
   fi
 
   # Clonezilla operation mode
@@ -685,27 +704,29 @@ print_summary() {
   else
     printf "  %-22s %s\n" "DHCP:" "disabled"
   fi
+  hr
   if [[ -n "${NFS_SERVER}" ]]; then
-    hr
     printf "  %-22s %s\n" "NFS server:"    "${NFS_SERVER}"
     printf "  %-22s %s\n" "NFS share:"     "${NFS_SHARE}"
     printf "  %-22s %s\n" "NFS version:"   "${NFS_VERSION}"
     printf "  %-22s %s\n" "NFS wait:"      "${NFS_WAIT_SEC}s"
-    printf "  %-22s %s\n" "Mode:"          "${CZ_MODE}"
-    if [[ "${CZ_MODE}" != "interactive" ]]; then
-      printf "  %-22s %s\n" "Disk:"          "${CZ_DISK}"
-      printf "  %-22s %s\n" "Image name:"    "${CZ_IMAGE_NAME}"
-      printf "  %-22s %s\n" "Compression:"   "${CZ_COMPRESS}"
-      printf "  %-22s %s\n" "Post action:"   "${CZ_POST_ACTION}"
-      [[ -n "${CZ_EXTRA_ARGS}" ]] && \
-        printf "  %-22s %s\n" "Extra ocs-sr:" "${CZ_EXTRA_ARGS}"
-    fi
+  else
+    printf "  %-22s %s\n" "NFS:" "not configured (use --nfs-server / --nfs-share)"
+  fi
+  hr
+  printf "  %-22s %s\n" "Mode:"          "${CZ_MODE}"
+  if [[ "${CZ_MODE}" != "interactive" ]]; then
+    printf "  %-22s %s\n" "Disk:"          "${CZ_DISK}"
+    printf "  %-22s %s\n" "Image name:"    "${CZ_IMAGE_NAME}"
+    printf "  %-22s %s\n" "Compression:"   "${CZ_COMPRESS}"
+    printf "  %-22s %s\n" "Post action:"   "${CZ_POST_ACTION}"
+    [[ -n "${CZ_EXTRA_ARGS}" ]] && \
+      printf "  %-22s %s\n" "Extra ocs-sr:" "${CZ_EXTRA_ARGS}"
   fi
   hr
   if [[ "${DRY_RUN}" != "true" ]]; then
     printf "\n  ${BOLD}Write to USB:${RESET}\n"
-    printf "    sudo dd if=%s of=/dev/sdX bs=4M status=progress oflag=sync\n\n" \
-           "${OUTPUT_ISO}"
+    printf "    sudo ./burn-usb.sh --iso %s /dev/sdX\n\n" "${OUTPUT_ISO}"
   fi
 }
 

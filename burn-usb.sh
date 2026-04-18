@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# burn-usb.sh — write dhcp-clonezilla.iso to a USB device and verify the build.
+# burn-usb.sh — write a CustomCloneZilla ISO to a USB device and verify the build.
 #
 # Usage:
-#   ./burn-usb.sh /dev/sdX
-#   ./burn-usb.sh --iso /path/to/other.iso /dev/sdX
+#   sudo ./burn-usb.sh /dev/sdX
+#   sudo ./burn-usb.sh --iso /path/to/other.iso /dev/sdX
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
-DEFAULT_ISO="${BUILD_DIR}/dhcp-clonezilla.iso"
+DEFAULT_ISO="${BUILD_DIR}/custom-clonezilla.iso"
 
 # ---- Terminal colors ---------------------------------------------------------
 if [[ -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
@@ -73,7 +73,7 @@ fi
 
 # ---- Pre-flight checks -------------------------------------------------------
 [[ -f "${ISO_FILE}" ]] || die "ISO not found: ${ISO_FILE}
-  Build it first with: ./dhcp.sh"
+  Build it first with: ./build-iso.sh"
 
 command -v dd     >/dev/null || die "dd not found"
 command -v lsblk  >/dev/null || die "lsblk not found"
