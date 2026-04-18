@@ -45,9 +45,13 @@ hr()      { printf '%*s\n' "${COLUMNS:-80}" '' | tr ' ' '-'; }
 # ---- Defaults (overridden by config file, then by CLI args) -----------------
 
 # Clonezilla release to download if no local ISO is provided
-# Only amd64 is available for Clonezilla 3.x — i686 was dropped at 3.2.0-8.
-CLONEZILLA_VERSION="3.3.1-35"
-CLONEZILLA_ARCH="amd64"
+# amd64: stable builds on SourceForge  (3.x only; i686 was dropped at 3.2.0-8)
+# arm64: experimental builds on NCHC mirror  (no official stable arm64 yet)
+#        https://free.nchc.org.tw/clonezilla-live/experimental/arm/
+CLONEZILLA_VERSION=""                  # auto-derived from arch in compute_defaults()
+CLONEZILLA_ARCH="amd64"               # amd64 | arm64
+CLONEZILLA_AMD64_VERSION="3.3.1-35"  # latest stable amd64 (SourceForge)
+CLONEZILLA_ARM64_VERSION="3.3.2-21"  # latest experimental arm64 (NCHC)
 # Full URL is auto-computed in compute_defaults(); override here to pin a mirror
 CLONEZILLA_DOWNLOAD_URL=""
 
@@ -80,6 +84,20 @@ NFS_SHARE="/mnt/main/backup/systems"  # your NFS share path
 NFS_OPTS="defaults"                   # mount options passed to -o
 NFS_VERSION="4"                       # NFS version: 3 or 4
 NFS_WAIT_SEC="15"                     # seconds to sleep before NFS mount (lets DHCP settle)
+
+# ---------- Local Device (USB) Repository ------------------------------------
+# Alternative to NFS: scan for a removable USB block device at boot and mount
+# it as the Clonezilla image repository.  A small detection script is injected
+# into the ISO and invoked via ocs_prerun before Clonezilla starts.
+# - USB_REPO_LABEL: optional FAT/ext4 volume label filter (e.g. "CZ_IMAGES").
+#   Leave empty to use the first removable device found.
+# - When both NFS and USB_REPO_DETECT are set, NFS runs first (prerun 1-4);
+#   USB detection runs after (prerun 5) and exits silently if NFS already
+#   mounted /home/partimag.
+# - For Raspberry Pi 5: set CZ_DISK="nvme0n1" (NVMe via M.2 HAT+) or "mmcblk0"
+#   (SD card), or keep "sda" for an external USB target drive.
+USB_REPO_DETECT="false"
+USB_REPO_LABEL=""          # optional volume label filter, e.g. "CZ_IMAGES"
 
 # ---------- Clonezilla Operation ---------------------------------------------
 # Mode: backup | restore | interactive
@@ -146,8 +164,18 @@ ${BOLD}OPERATION OPTIONS${RESET}  (require --nfs-server and --nfs-share)
 
 ${BOLD}ISO OPTIONS${RESET}
       --iso FILE              Use local ISO instead of downloading
-      --czversion VER         Clonezilla version       (default: ${CLONEZILLA_VERSION})
+      --czversion VER         Clonezilla version       (default: per-arch, see below)
+      --arch ARCH             CPU architecture: amd64 | arm64  (default: ${CLONEZILLA_ARCH})
+                              arm64 downloads from the NCHC experimental mirror
   -o, --output FILE           Output ISO path          (default: build/custom-clonezilla.iso)
+
+${BOLD}USB REPOSITORY OPTIONS${RESET}
+      --usb-repo-detect       Inject a USB drive detection script into the ISO.
+                              At boot, scans for a removable block device and
+                              mounts it as the Clonezilla image repo (ocs_prerun).
+      --usb-repo-label LABEL  Only use a USB partition with this volume label
+                              (e.g. CZ_IMAGES).  Ignored unless --usb-repo-detect.
+                              Raspberry Pi 5 + NVMe: also set --disk nvme0n1.
 
 ${BOLD}SCRIPT OPTIONS${RESET}
   -c, --config FILE           Load settings from FILE  (see config/settings.conf)
@@ -170,6 +198,20 @@ ${BOLD}EXAMPLES${RESET}
   ${SCRIPT_NAME} \\
     --nfs-server 192.168.1.100 --nfs-share /mnt/backups \\
     --mode backup --disk sda --image server01 --post-action poweroff
+
+  # Raspberry Pi 5 — restore NVMe from a labeled USB drive:
+  #   Prerequisites:
+  #     1. Install rpi5-uefi firmware on Pi 5 (https://github.com/worproject/rpi5-uefi)
+  #        so the Pi boots as a standard ARM64 UEFI device.
+  #     2. Set Pi EEPROM boot order: BOOT_ORDER=0xf164  (USB first, then NVMe).
+  #        Run on the Pi: sudo rpi-eeprom-config --edit
+  #     3. Format a USB drive, create one partition labeled "CZ_IMAGES", and
+  #        copy your Clonezilla image folders onto it.
+  ${SCRIPT_NAME} \\
+    --arch arm64 \\
+    --mode restore --disk nvme0n1 --image pi5-backup \\
+    --usb-repo-detect --usb-repo-label CZ_IMAGES \\
+    --post-action reboot
 
   # Use a config file (great for repeatable builds):
   ${SCRIPT_NAME} --config config/settings.conf
@@ -209,7 +251,10 @@ parse_args() {
          --extra-args)        CZ_EXTRA_ARGS="$2";         shift 2 ;;
          --iso)               LOCAL_ISO="$2";             shift 2 ;;
          --czversion)         CLONEZILLA_VERSION="$2";    shift 2 ;;
+         --arch)              CLONEZILLA_ARCH="$2";       shift 2 ;;
       -o|--output)            OUTPUT_ISO="$2";            shift 2 ;;
+         --usb-repo-detect)   USB_REPO_DETECT="true";     shift   ;;
+         --usb-repo-label)    USB_REPO_LABEL="$2";        shift 2 ;;
          --keep-work-dir)     KEEP_WORK_DIR="true";       shift   ;;
          --dry-run)           DRY_RUN="true";             shift   ;;
       -v|--verbose)           VERBOSE="true";             shift   ;;
@@ -236,8 +281,29 @@ compute_defaults() {
   ISO_EXTRACT_DIR="${BUILD_DIR}/extract"
 
   if [[ -z "${CLONEZILLA_DOWNLOAD_URL}" ]]; then
+    # Resolve default version from arch when not explicitly pinned
+    if [[ -z "${CLONEZILLA_VERSION}" ]]; then
+      if [[ "${CLONEZILLA_ARCH}" == "arm64" ]]; then
+        CLONEZILLA_VERSION="${CLONEZILLA_ARM64_VERSION}"
+      else
+        CLONEZILLA_VERSION="${CLONEZILLA_AMD64_VERSION}"
+      fi
+    fi
     local iso_file="clonezilla-live-${CLONEZILLA_VERSION}-${CLONEZILLA_ARCH}.iso"
-    CLONEZILLA_DOWNLOAD_URL="https://downloads.sourceforge.net/project/clonezilla/clonezilla_live_stable/${CLONEZILLA_VERSION}/${iso_file}"
+    if [[ "${CLONEZILLA_ARCH}" == "arm64" ]]; then
+      # arm64 ISOs are published at the NCHC experimental mirror only —
+      # no official arm64 stable builds exist on SourceForge as of 2026.
+      CLONEZILLA_DOWNLOAD_URL="http://free.nchc.org.tw/clonezilla-live/experimental/arm/${CLONEZILLA_VERSION}/${iso_file}"
+    else
+      CLONEZILLA_DOWNLOAD_URL="https://downloads.sourceforge.net/project/clonezilla/clonezilla_live_stable/${CLONEZILLA_VERSION}/${iso_file}"
+    fi
+  elif [[ -z "${CLONEZILLA_VERSION}" ]]; then
+    # URL was pinned manually but version string is still needed for the ISO filename
+    if [[ "${CLONEZILLA_ARCH}" == "arm64" ]]; then
+      CLONEZILLA_VERSION="${CLONEZILLA_ARM64_VERSION}"
+    else
+      CLONEZILLA_VERSION="${CLONEZILLA_AMD64_VERSION}"
+    fi
   fi
 
   # Cache the downloaded ISO in build/iso/ so subsequent runs skip the download.
@@ -255,6 +321,11 @@ compute_defaults() {
 
 # ---- Validate configuration -------------------------------------------------
 validate_config() {
+  case "${CLONEZILLA_ARCH}" in
+    amd64|arm64) ;;
+    *) die "Invalid --arch '${CLONEZILLA_ARCH}'. Must be: amd64 | arm64" ;;
+  esac
+
   case "${CZ_MODE}" in
     backup|restore|interactive) ;;
     *) die "Invalid --mode '${CZ_MODE}'. Must be: backup | restore | interactive" ;;
@@ -361,6 +432,7 @@ extract_iso() {
 #                  and Clonezilla both expect these predictable names.
 build_boot_params() {
   local p=""
+  local prerun_n=0     # running counter for ocs_prerunN keys (auto-incremented)
 
   # Locale / keyboard
   p+=" locales=${LANGUAGE}"
@@ -381,23 +453,32 @@ build_boot_params() {
 
   # NFS mount via ocs_prerun — runs before Clonezilla's UI starts.
   #
-  # ocs_prerun1: sleep so the ip=dhcp lease (obtained in initrd) has settled.
-  # ocs_prerun2: mount the NFS share at Clonezilla's image directory.
-  # ocs_prerun3: write ocsroot_src=skip to ocs-live.conf so ocs-prep-repo skips
-  #              the storage-type selection dialog (it checks: if ocsroot_src is
-  #              already set, skip the menu — source: sbin/ocs-prep-repo line 1187).
-  # ocs_prerun4: write ocs_live_type=device-image so the clonezilla script skips
-  #              the mode selection dialog and goes straight to save/restore
-  #              (source: sbin/clonezilla line 52).
+  # prerunN+0: sleep so the ip=dhcp lease (obtained in initrd) has settled.
+  # prerunN+1: mount the NFS share at Clonezilla's image directory.
+  # prerunN+2: write ocsroot_src=skip to ocs-live.conf so ocs-prep-repo skips
+  #            the storage-type selection dialog (it checks: if ocsroot_src is
+  #            already set, skip the menu — source: sbin/ocs-prep-repo line 1187).
+  # prerunN+3: write ocs_live_type=device-image so the clonezilla script skips
+  #            the mode selection dialog and goes straight to save/restore
+  #            (source: sbin/clonezilla line 52).
   if [[ -n "${NFS_SERVER}" && -n "${NFS_SHARE}" ]]; then
     local nfs_mount_opts="nfsvers=${NFS_VERSION}"
     [[ "${NFS_OPTS}" != "defaults" && -n "${NFS_OPTS}" ]] \
       && nfs_mount_opts="${nfs_mount_opts},${NFS_OPTS}"
 
-    p+=" ocs_prerun1=\"sleep ${NFS_WAIT_SEC}\""
-    p+=" ocs_prerun2=\"mount -t nfs -o ${nfs_mount_opts} ${NFS_SERVER}:${NFS_SHARE} /home/partimag\""
-    p+=" ocs_prerun3=\"echo ocsroot_src=skip >> /etc/ocs/ocs-live.conf\""
-    p+=" ocs_prerun4=\"echo ocs_live_type=device-image >> /etc/ocs/ocs-live.conf\""
+    p+=" ocs_prerun$(( prerun_n += 1 ))=\"sleep ${NFS_WAIT_SEC}\""
+    p+=" ocs_prerun$(( prerun_n += 1 ))=\"mount -t nfs -o ${nfs_mount_opts} ${NFS_SERVER}:${NFS_SHARE} /home/partimag\""
+    p+=" ocs_prerun$(( prerun_n += 1 ))=\"echo ocsroot_src=skip >> /etc/ocs/ocs-live.conf\""
+    p+=" ocs_prerun$(( prerun_n += 1 ))=\"echo ocs_live_type=device-image >> /etc/ocs/ocs-live.conf\""
+  fi
+
+  # USB local device detection — scan for a removable block device and mount
+  # it as the image repo.  The detection script is injected into the ISO by
+  # inject_usb_detect_script() and referenced here via the live-boot mount
+  # point (/lib/live/mount/medium is live-boot's standard path for the boot
+  # medium — USB stick, CD, etc. — after the squashfs is fully mounted).
+  if [[ "${USB_REPO_DETECT}" == "true" ]]; then
+    p+=" ocs_prerun$(( prerun_n += 1 ))=\"bash /lib/live/mount/medium/scripts/cz-usb-repo.sh\""
   fi
 
   # Clonezilla operation mode
@@ -528,6 +609,12 @@ EOF
 modify_isolinux_cfg() {
   section "Modifying isolinux/syslinux config (BIOS)"
 
+  # isolinux/syslinux is an x86-only bootloader — not present in arm64 ISOs.
+  if [[ "${CLONEZILLA_ARCH}" == "arm64" ]]; then
+    log "Skipping isolinux/syslinux modification — not applicable for arm64 (UEFI-only)."
+    return 0
+  fi
+
   # Clonezilla places these configs in known locations
   local cfg_candidates=(
     "${ISO_EXTRACT_DIR}/isolinux/isolinux.cfg"
@@ -610,6 +697,62 @@ METAEOF
   debug "$(cat "${out}")"
 }
 
+# ---- Inject USB repository detection script into the ISO tree ---------------
+# The script scans /sys/block for removable block devices and mounts the first
+# matching partition at /home/partimag (Clonezilla's default ocsroot).  It also
+# writes ocsroot_src=skip and ocs_live_type=device-image into ocs-live.conf so
+# Clonezilla's storage-selection and mode-selection dialogs are suppressed.
+#
+# The script lands at /scripts/cz-usb-repo.sh in the ISO (non-squashfs layer).
+# live-boot makes the boot medium available at /lib/live/mount/medium/ after the
+# squashfs is fully mounted, so ocs_prerun can reference it there at runtime.
+inject_usb_detect_script() {
+  [[ "${USB_REPO_DETECT}" != "true" ]] && return 0
+  section "Injecting USB repo detection script"
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log "[DRY RUN] Would write: ${ISO_EXTRACT_DIR}/scripts/cz-usb-repo.sh"
+    return 0
+  fi
+
+  local scripts_dir="${ISO_EXTRACT_DIR}/scripts"
+  mkdir -p "${scripts_dir}"
+  local script="${scripts_dir}/cz-usb-repo.sh"
+
+  # USB_REPO_LABEL is substituted at build time; the script compares it at
+  # runtime against the partition's volume label returned by blkid.
+  cat > "${script}" <<SCRIPT
+#!/bin/bash
+# Auto-detect a USB storage device and mount it as the Clonezilla image repo.
+# Generated by CustomCloneZilla ${VERSION} on ${BUILD_DATE_TAG}
+# Invoked via ocs_prerun from the Clonezilla boot command line.
+USB_REPO_LABEL="${USB_REPO_LABEL}"
+
+for devpath in /sys/block/sd*; do
+  dev=\$(basename "\$devpath")
+  [ "\$(cat "\$devpath/removable" 2>/dev/null)" = "1" ] || continue
+  for part in /dev/\${dev}[0-9]*; do
+    [ -b "\$part" ] || continue
+    if [ -n "\$USB_REPO_LABEL" ]; then
+      actual_label=\$(blkid -s LABEL -o value "\$part" 2>/dev/null)
+      [ "\$actual_label" = "\$USB_REPO_LABEL" ] || continue
+    fi
+    if mount "\$part" /home/partimag 2>/dev/null; then
+      echo "ocsroot_src=skip"           >> /etc/ocs/ocs-live.conf
+      echo "ocs_live_type=device-image" >> /etc/ocs/ocs-live.conf
+      echo "[usb-repo] Mounted \$part as Clonezilla image repo (label: \${USB_REPO_LABEL:-any})"
+      exit 0
+    fi
+  done
+done
+echo "[usb-repo] No suitable USB storage device found"
+exit 1
+SCRIPT
+
+  chmod +x "${script}"
+  log "USB detection script written: ${script}"
+}
+
 # ---- Repack bootable ISO ----------------------------------------------------
 repack_iso() {
   section "Repacking ISO"
@@ -627,10 +770,13 @@ repack_iso() {
 
   # Extract MBR bootstrap code (first 432 bytes) for USB hybrid boot.
   # This carries the original hybrid MBR so the USB is bootable on BIOS machines.
+  # Skipped for arm64: no hybrid MBR is needed on UEFI-only ARM hardware.
   local mbr_file="${BUILD_DIR}/isohdpfx.bin"
-  dd if="${LOCAL_ISO}" bs=432 count=1 of="${mbr_file}" 2>/dev/null \
-    && debug "MBR extracted: ${mbr_file}" \
-    || warn "Could not extract MBR — USB hybrid boot may not work."
+  if [[ "${CLONEZILLA_ARCH}" != "arm64" ]]; then
+    dd if="${LOCAL_ISO}" bs=432 count=1 of="${mbr_file}" 2>/dev/null \
+      && debug "MBR extracted: ${mbr_file}" \
+      || warn "Could not extract MBR — USB hybrid boot may not work."
+  fi
 
   # Locate the isolinux/syslinux binary inside the extracted tree
   local isolinux_bin="" isolinux_cat=""
@@ -649,15 +795,29 @@ repack_iso() {
   # Build boot flags as a proper bash array so IFS=$'\n\t' doesn't swallow
   # individual flags (unquoted string expansion breaks with this IFS).
   local boot_flags=()
-  if [[ -f "${mbr_file}" ]]; then
-    boot_flags+=( --grub2-mbr "${mbr_file}" --protective-msdos-label -partition_offset 16 )
-  fi
-  if [[ -n "${isolinux_bin}" ]]; then
-    boot_flags+=( -c "${isolinux_cat}" -b "${isolinux_bin}" )
-    boot_flags+=( -no-emul-boot -boot-load-size 4 -boot-info-table --grub2-boot-info )
-  fi
-  if [[ -f "${efi_img}" ]]; then
-    boot_flags+=( -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot -isohybrid-gpt-basdat )
+  if [[ "${CLONEZILLA_ARCH}" == "arm64" ]]; then
+    # ARM64: UEFI-only ISO — no hybrid MBR and no isolinux/syslinux.
+    # The Pi 5 (and any other ARM64 UEFI board) loads GRUB directly from the
+    # EFI system partition.  A Pi 5 running the rpi5-uefi firmware
+    # (https://github.com/worproject/rpi5-uefi) will boot this USB as a
+    # standard ARM64 UEFI device.
+    if [[ -f "${efi_img}" ]]; then
+      boot_flags+=( -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot )
+    else
+      warn "efi.img not found at boot/grub/efi.img — arm64 ISO may not boot via UEFI."
+    fi
+  else
+    # AMD64: hybrid ISO supports both legacy BIOS (isolinux) and UEFI (GRUB2).
+    if [[ -f "${mbr_file}" ]]; then
+      boot_flags+=( --grub2-mbr "${mbr_file}" --protective-msdos-label -partition_offset 16 )
+    fi
+    if [[ -n "${isolinux_bin}" ]]; then
+      boot_flags+=( -c "${isolinux_cat}" -b "${isolinux_bin}" )
+      boot_flags+=( -no-emul-boot -boot-load-size 4 -boot-info-table --grub2-boot-info )
+    fi
+    if [[ -f "${efi_img}" ]]; then
+      boot_flags+=( -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot -isohybrid-gpt-basdat )
+    fi
   fi
 
   debug "Boot flags: ${boot_flags[*]}"
@@ -693,6 +853,7 @@ print_summary() {
   section "Build Summary"
   hr
   printf "  %-22s %s\n" "Output ISO:"      "${OUTPUT_ISO}"
+  printf "  %-22s %s\n" "Architecture:"    "${CLONEZILLA_ARCH}"
   hr
   printf "  %-22s %s\n" "Language:"        "${LANGUAGE}"
   printf "  %-22s %s\n" "Keyboard layout:" "${KEYBOARD_LAYOUT}${KEYBOARD_VARIANT:+ (${KEYBOARD_VARIANT})}"
@@ -722,6 +883,12 @@ print_summary() {
     printf "  %-22s %s\n" "Post action:"   "${CZ_POST_ACTION}"
     [[ -n "${CZ_EXTRA_ARGS}" ]] && \
       printf "  %-22s %s\n" "Extra ocs-sr:" "${CZ_EXTRA_ARGS}"
+  fi
+  hr
+  if [[ "${USB_REPO_DETECT}" == "true" ]]; then
+    local label_str="${USB_REPO_LABEL:-any removable device}"
+    printf "  %-22s %s\n" "USB repo detect:" "enabled (label: ${label_str})"
+    printf "  %-22s %s\n" "" "script: /scripts/cz-usb-repo.sh"
   fi
   hr
   if [[ "${DRY_RUN}" != "true" ]]; then
@@ -785,6 +952,7 @@ main() {
   obtain_iso
   extract_iso
   write_build_info
+  inject_usb_detect_script
   modify_grub_cfg
   modify_isolinux_cfg
   repack_iso
